@@ -75,13 +75,45 @@ def test_same_seed_gives_same_sequence():
 
 def test_stop_token_respects_min_tokens():
     model = MarkovChain(order=1, random_seed=42)
-    model.fit([["a", "EOS", "a", "EOS"]])
+    model.fit([["a", "EOS"], ["a", "b", "a"]])
 
     generated = model.generate(
-        initial_context=["a"], max_tokens=10, stop_tokens=["EOS"], min_tokens=3
+        initial_context=["a"],
+        restart_context=["a"],
+        max_tokens=2,
+        stop_tokens=["EOS"],
+        min_tokens=2,
     )
-    # EOS cannot stop us before 3 tokens are produced.
-    assert len(generated) >= 3
+    # EOS is masked, not emitted-and-ignored, before the minimum length.
+    assert generated == ["b", "a"]
+    assert "EOS" not in generated
+
+
+def test_fixed_restart_context_is_used_after_dead_end():
+    model = MarkovChain(order=1, random_seed=42)
+    model.fit([["BOS", "a", "EOS"]])
+
+    generated = model.generate(
+        initial_context=["EOS"],
+        restart_context=["BOS"],
+        max_tokens=1,
+        dead_end_strategy="restart",
+    )
+
+    assert generated == ["a"]
+    assert model.last_dead_end_count == 1
+
+
+def test_invalid_restart_context_is_rejected():
+    model = MarkovChain(order=1, random_seed=42)
+    model.fit([["BOS", "a"]])
+
+    with pytest.raises(ValueError, match="restart_context"):
+        model.generate(
+            initial_context=["BOS"],
+            restart_context=["missing"],
+            max_tokens=1,
+        )
 
 
 def test_hashable_tuple_tokens():
