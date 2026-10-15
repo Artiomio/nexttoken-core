@@ -58,6 +58,9 @@ generated = model.generate(
     initial_context=["BOS"] * 3,
     max_tokens=200,
     dead_end_strategy="restart",     # or "stop" / "error"
+    restart_context=["BOS"] * 3,     # optional fixed restart point
+    stop_tokens=["EOS"],
+    min_tokens=150,                  # EOS is masked before this length
 )
 ```
 
@@ -69,6 +72,11 @@ Notes:
 * `next_distribution` returns a vector aligned with `model.vocabulary`, or
   `None` for a *dead end*. `dead_end_strategy="restart"` jumps to a context that
   has a continuation in the training data — this is a restart, not a backoff.
+  By default that context is sampled from observed contexts; `restart_context`
+  can pin it to a known boundary such as `BOS`.
+* `stop_tokens` are masked out until `min_tokens` have been produced, then the
+  remaining probability mass is renormalized. This prevents an early `EOS`
+  from entering the generated stream and immediately causing a dead end.
 * `distr_offset` is a peak-flattening threshold applied to already-observed
   transitions. It is **not** add-k smoothing.
 * The old off-by-one (`len_uniques = max(...)`) is fixed; the vocabulary size is
