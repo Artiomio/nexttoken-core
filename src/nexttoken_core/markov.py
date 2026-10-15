@@ -55,9 +55,12 @@ class MarkovChain:
       next one is *never* counted.
     * ``next_distribution`` returns ``None`` for a *dead end* (a context that
       never occurred in the training data, or whose outgoing mass is zero).
-    * ``dead_end_strategy="restart"`` jumps to a random context that is known
-      to have a continuation in the training data. This is a restart, **not**
-      a backoff: the model does not build statistics for shorter contexts.
+    * ``dead_end_strategy="restart"`` jumps to a context that is known to
+      have a continuation in the training data. By default that context is
+      sampled from the observed contexts; callers may provide a fixed
+      ``restart_context`` (for example a BOS context). This is a restart,
+      **not** a backoff: the model does not build statistics for shorter
+      contexts.
     """
 
     def __init__(self, order=3, random_seed=None, distr_offset=0):
@@ -167,6 +170,7 @@ class MarkovChain:
         initial_context=None,
         max_tokens=200,
         dead_end_strategy="restart",
+        restart_context=None,
         stop_tokens=None,
         min_tokens=0,
     ):
@@ -182,11 +186,18 @@ class MarkovChain:
         dead_end_strategy:
             ``"restart"`` (jump to a known-good context), ``"stop"`` or
             ``"error"``.
+        restart_context:
+            Optional context used by the ``"restart"`` strategy. If omitted,
+            a random observed context is chosen, preserving the historical
+            behaviour. A fixed BOS context is useful for sequence formats whose
+            decoder has state, such as pitch intervals.
         stop_tokens:
             Tokens that stop generation once ``min_tokens`` were produced.
         min_tokens:
             Minimum number of tokens to produce before ``stop_tokens`` is
-            honoured (so e.g. ``EOS`` cannot end the piece too early).
+            allowed. Before that point their probability mass is masked out and
+            the remaining distribution is renormalized. If only stop tokens are
+            possible, the context is treated as a dead end.
         """
         if self.tokenizer_ is None:
             raise RuntimeError("fit() must be called before generate()")
@@ -194,16 +205,39 @@ class MarkovChain:
             raise ValueError("unknown dead_end_strategy %r" % (dead_end_strategy,))
         if max_tokens < 0:
             raise ValueError("max_tokens must be >= 0")
+        if min_tokens < 0:
+            raise ValueError("min_tokens must be >= 0")
 
         stop_set = set(stop_tokens or [])
+        stop_ids = [
+            self.tokenizer_.token_to_id[token]
+            for token in stop_set
+            if token in self.tokenizer_.token_to_id
+        ]
+
+        def prepare_context(value, name):
+            prepared = list(value)[-self.order :]
+            if not prepared:
+                raise ValueError(f"{name} must not be empty")
+            if len(prepared) < self.order:
+                # Keep the old padding convention for short explicit contexts.
+                prepared = [prepared[0]] * (self.order - len(prepared)) + prepared
+            return prepared
 
         if initial_context is None:
             context = self._random_observed_context()
         else:
-            context = list(initial_context)[-self.order :]
-            if len(context) < self.order:
-                # pad to the left with the first token so the context is valid
-                context = [context[0]] * (self.order - len(context)) + context
+            context = prepare_context(initial_context, "initial_context")
+
+        fixed_restart_context = None
+        if restart_context is not None:
+            fixed_restart_context = prepare_context(
+                restart_context, "restart_context"
+            )
+            if self.next_distribution(fixed_restart_context) is None:
+                raise ValueError(
+                    "restart_context must be an observed context with a continuation"
+                )
 
         generated = []
         dead_ends = 0
@@ -215,13 +249,27 @@ class MarkovChain:
                 raise RuntimeError("generation made no progress (dead-end loop)")
 
             distr = self.next_distribution(context)
+
+            # Before the minimum length, stop tokens are not generated at all.
+            # This avoids appending (for example) EOS and then silently continuing
+            # from an EOS dead end.
+            if distr is not None and stop_ids and len(generated) < min_tokens:
+                distr = distr.copy()
+                distr[stop_ids] = 0
+                total = distr.sum()
+                distr = distr / total if total > 0 else None
+
             if distr is None:
                 dead_ends += 1
                 if dead_end_strategy == "stop":
                     break
                 if dead_end_strategy == "error":
                     raise RuntimeError("dead end at context %r" % (context,))
-                context = self._random_observed_context()
+                context = (
+                    list(fixed_restart_context)
+                    if fixed_restart_context is not None
+                    else self._random_observed_context()
+                )
                 continue
 
             index = int(self._rng.choice(self.vocabulary_size, p=distr))
